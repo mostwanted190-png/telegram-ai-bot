@@ -13,7 +13,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 groq = Groq(api_key=GROQ_API_KEY)
 
-ADMIN_ID = 123456789  # <-- ВСТАВЬ СВОЙ TELEGRAM ID
+ADMIN_ID = 6288084946
 
 DAILY_LIMIT = 20
 
