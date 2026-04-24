@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import requests
 from fastapi import FastAPI, Request
 from groq import Groq
@@ -11,12 +12,32 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 groq = Groq(api_key=GROQ_API_KEY)
 
-user_memory = {}
-user_roles = {}
-user_stats = {}
+# ===== БАЗА ДАННЫХ =====
+
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    role TEXT DEFAULT 'ассистент',
+    message_count INTEGER DEFAULT 0
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    role TEXT,
+    content TEXT
+)
+""")
+
+conn.commit()
 
 ROLES = {
-    "ассистент": "Ты дружелюбный AI ассистент. Отвечай на русском.",
+    "ассистент": "Ты дружелюбный AI ассистент.",
     "программист": "Ты опытный программист.",
     "учитель": "Ты объясняешь просто.",
     "шутник": "Ты отвечаешь с юмором.",
@@ -24,7 +45,7 @@ ROLES = {
     "художник": "Ты создаёшь детальные промпты для генерации изображений."
 }
 
-# ===== ОТПРАВКА =====
+# ===== УТИЛИТЫ =====
 
 def send_message(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
@@ -32,7 +53,42 @@ def send_message(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
-# ===== ГЛАВНОЕ МЕНЮ =====
+def get_user(user_id):
+    cursor.execute("SELECT role, message_count FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    if not result:
+        cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        return "ассистент", 0
+    return result
+
+def save_message(user_id, role, content):
+    cursor.execute(
+        "INSERT INTO memory (user_id, role, content) VALUES (?, ?, ?)",
+        (user_id, role, content)
+    )
+    conn.commit()
+
+def get_memory(user_id, limit=10):
+    cursor.execute(
+        "SELECT role, content FROM memory WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit)
+    )
+    rows = cursor.fetchall()
+    return [{"role": r, "content": c} for r, c in reversed(rows)]
+
+def clear_memory(user_id):
+    cursor.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+def increment_message_count(user_id):
+    cursor.execute(
+        "UPDATE users SET message_count = message_count + 1 WHERE user_id = ?",
+        (user_id,)
+    )
+    conn.commit()
+
+# ===== МЕНЮ =====
 
 def main_menu():
     return {
@@ -72,17 +128,18 @@ async def webhook(request: Request):
 
         elif action.startswith("role_"):
             role = action.replace("role_", "")
-            user_roles[user_id] = role
-            user_memory[user_id] = []
+            cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+            conn.commit()
+            clear_memory(user_id)
             send_message(chat_id, f"✅ Роль: {role}", main_menu())
 
         elif action == "clear":
-            user_memory[user_id] = []
+            clear_memory(user_id)
             send_message(chat_id, "🧠 Память очищена", main_menu())
 
         elif action == "stats":
-            messages = user_stats.get(user_id, 0)
-            send_message(chat_id, f"📊 Ты отправил сообщений: {messages}", main_menu())
+            role, count = get_user(user_id)
+            send_message(chat_id, f"📊 Сообщений: {count}\nРоль: {role}", main_menu())
 
         return {"ok": True}
 
@@ -99,20 +156,14 @@ async def webhook(request: Request):
         send_message(chat_id, "🤖 Добро пожаловать!", main_menu())
         return {"ok": True}
 
-    if user_id not in user_memory:
-        user_memory[user_id] = []
-    if user_id not in user_stats:
-        user_stats[user_id] = 0
+    role, _ = get_user(user_id)
+    increment_message_count(user_id)
 
-    user_stats[user_id] += 1
+    save_message(user_id, "user", text)
 
-    role = user_roles.get(user_id, "ассистент")
-    system_prompt = ROLES[role]
+    history = get_memory(user_id)
 
-    user_memory[user_id].append({"role": "user", "content": text})
-
-    messages = [{"role": "system", "content": system_prompt}] + \
-               user_memory[user_id][-10:]
+    messages = [{"role": "system", "content": ROLES[role]}] + history
 
     response = groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -121,7 +172,8 @@ async def webhook(request: Request):
     )
 
     reply = response.choices[0].message.content
-    user_memory[user_id].append({"role": "assistant", "content": reply})
+
+    save_message(user_id, "assistant", reply)
 
     send_message(chat_id, reply)
 
