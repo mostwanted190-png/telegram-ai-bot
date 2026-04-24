@@ -9,13 +9,15 @@ app = FastAPI()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 groq = Groq(api_key=GROQ_API_KEY)
 
 ADMIN_ID = 6288084946
 
-DAILY_LIMIT = 20
+FREE_LIMIT = 20
+PREMIUM_LIMIT = 100
 
 # ===== БАЗА =====
 
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     role TEXT DEFAULT 'ассистент',
     message_count INTEGER DEFAULT 0,
-    subscription INTEGER DEFAULT 0
+    tier INTEGER DEFAULT 0
 )
 """)
 
@@ -51,10 +53,8 @@ CREATE TABLE IF NOT EXISTS usage (
 
 conn.commit()
 
-# ===== РОЛИ =====
-
 ROLES = {
-    "ассистент": "Ты дружелюбный AI ассистент. Отвечай на русском.",
+    "ассистент": "Ты дружелюбный AI ассистент.",
     "программист": "Ты опытный программист.",
     "учитель": "Ты объясняешь просто.",
     "шутник": "Ты отвечаешь с юмором.",
@@ -70,82 +70,73 @@ def send_message(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
+def send_photo(chat_id, image_bytes):
+    requests.post(
+        f"{TELEGRAM_API}/sendPhoto",
+        files={"photo": ("image.png", image_bytes)},
+        data={"chat_id": chat_id}
+    )
+
+def generate_image(prompt):
+    response = requests.post(
+        "https://api.stability.ai/v2beta/stable-image/generate/sd3",
+        headers={
+            "Authorization": f"Bearer {STABILITY_API_KEY}",
+            "Accept": "image/*"
+        },
+        files={
+            "prompt": (None, prompt),
+            "output_format": (None, "png"),
+        },
+    )
+    if response.status_code == 200:
+        return response.content
+    return None
+
 def get_user(user_id):
-    cursor.execute("SELECT role, message_count, subscription FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT role, tier FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
     if not result:
         cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
-        return "ассистент", 0, 0
+        return "ассистент", 0
     return result
-
-def save_message(user_id, role, content):
-    cursor.execute(
-        "INSERT INTO memory (user_id, role, content) VALUES (?, ?, ?)",
-        (user_id, role, content)
-    )
-    conn.commit()
-
-def get_memory(user_id, limit=10):
-    cursor.execute(
-        "SELECT role, content FROM memory WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        (user_id, limit)
-    )
-    rows = cursor.fetchall()
-    return [{"role": r, "content": c} for r, c in reversed(rows)]
-
-def clear_memory(user_id):
-    cursor.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
-    conn.commit()
-
-def increment_message_count(user_id):
-    cursor.execute(
-        "UPDATE users SET message_count = message_count + 1 WHERE user_id = ?",
-        (user_id,)
-    )
-    conn.commit()
 
 def check_limit(user_id):
     today = datetime.now().strftime("%Y-%m-%d")
+    cursor.execute("SELECT tier FROM users WHERE user_id = ?", (user_id,))
+    tier = cursor.fetchone()[0]
 
-    cursor.execute("SELECT subscription FROM users WHERE user_id = ?", (user_id,))
-    sub = cursor.fetchone()
-
-    if sub and sub[0] == 1:
+    if tier == 2:
         return True
 
-    cursor.execute(
-        "SELECT count FROM usage WHERE user_id = ? AND date = ?",
-        (user_id, today)
-    )
+    limit = FREE_LIMIT if tier == 0 else PREMIUM_LIMIT
+
+    cursor.execute("SELECT count FROM usage WHERE user_id = ? AND date = ?", (user_id, today))
     result = cursor.fetchone()
 
     if not result:
-        cursor.execute(
-            "INSERT INTO usage (user_id, date, count) VALUES (?, ?, 1)",
-            (user_id, today)
-        )
+        cursor.execute("INSERT INTO usage VALUES (?, ?, 1)", (user_id, today))
         conn.commit()
         return True
 
-    if result[0] >= DAILY_LIMIT:
+    if result[0] >= limit:
         return False
 
-    cursor.execute(
-        "UPDATE usage SET count = count + 1 WHERE user_id = ? AND date = ?",
-        (user_id, today)
-    )
+    cursor.execute("UPDATE usage SET count = count + 1 WHERE user_id = ? AND date = ?", (user_id, today))
     conn.commit()
     return True
 
-def main_menu():
-    return {
-        "inline_keyboard": [
-            [{"text": "🎭 Роли", "callback_data": "roles"}],
-            [{"text": "🧠 Очистить память", "callback_data": "clear"}],
-            [{"text": "📊 Статистика", "callback_data": "stats"}],
-        ]
-    }
+def save_message(user_id, role, content):
+    cursor.execute("INSERT INTO memory (user_id, role, content) VALUES (?, ?, ?)",
+                   (user_id, role, content))
+    conn.commit()
+
+def get_memory(user_id):
+    cursor.execute("SELECT role, content FROM memory WHERE user_id = ? ORDER BY id DESC LIMIT 10",
+                   (user_id,))
+    rows = cursor.fetchall()
+    return [{"role": r, "content": c} for r, c in reversed(rows)]
 
 # ===== WEBHOOK =====
 
@@ -153,51 +144,6 @@ def main_menu():
 async def webhook(request: Request):
     data = await request.json()
 
-    # CALLBACK
-    if "callback_query" in data:
-        callback = data["callback_query"]
-        user_id = callback["from"]["id"]
-        chat_id = callback["message"]["chat"]["id"]
-        action = callback["data"]
-
-        requests.post(
-            f"{TELEGRAM_API}/answerCallbackQuery",
-            json={"callback_query_id": callback["id"]}
-        )
-
-        if action == "roles":
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": role, "callback_data": f"role_{role}"}]
-                    for role in ROLES.keys()
-                ]
-            }
-            send_message(chat_id, "🎭 Выбери роль:", keyboard)
-
-        elif action.startswith("role_"):
-            role = action.replace("role_", "")
-            cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
-            conn.commit()
-            clear_memory(user_id)
-            send_message(chat_id, f"✅ Роль: {role}", main_menu())
-
-        elif action == "clear":
-            clear_memory(user_id)
-            send_message(chat_id, "🧠 Память очищена", main_menu())
-
-        elif action == "stats":
-            role, count, sub = get_user(user_id)
-            send_message(
-                chat_id,
-                f"📊 Сообщений: {count}\n"
-                f"Роль: {role}\n"
-                f"Подписка: {'✅ Да' if sub else '❌ Нет'}",
-                main_menu()
-            )
-
-        return {"ok": True}
-
-    # MESSAGE
     if "message" not in data:
         return {"ok": True}
 
@@ -207,31 +153,53 @@ async def webhook(request: Request):
     text = message.get("text")
 
     if text == "/start":
-        send_message(chat_id, "🤖 Добро пожаловать!", main_menu())
+        send_message(chat_id,
+                     "🤖 AI Бот PRO\n\n"
+                     "/image — генерация изображения\n"
+                     "/buy — подписка\n"
+                     "/stats — статистика")
         return {"ok": True}
 
     if text == "/buy":
         send_message(chat_id,
-            "💎 Подписка — 299₽/месяц.\n"
-            "Напишите администратору для подключения.")
+                     "💎 Подписка PRO:\n"
+                     "• 100 сообщений — Premium\n"
+                     "• Безлимит — PRO\n\n"
+                     "Свяжитесь с администратором.")
         return {"ok": True}
 
-    if text and text.startswith("/give_sub") and user_id == ADMIN_ID:
-        target = int(text.split()[1])
-        cursor.execute("UPDATE users SET subscription = 1 WHERE user_id = ?", (target,))
-        conn.commit()
-        send_message(chat_id, "✅ Подписка выдана")
+    if text == "/users" and user_id == ADMIN_ID:
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total = cursor.fetchone()[0]
+        send_message(chat_id, f"👥 Пользователей: {total}")
         return {"ok": True}
 
-    role, _, _ = get_user(user_id)
+    if text == "/stats" and user_id == ADMIN_ID:
+        cursor.execute("SELECT SUM(message_count) FROM users")
+        total = cursor.fetchone()[0] or 0
+        send_message(chat_id, f"📊 Всего сообщений: {total}")
+        return {"ok": True}
+
+    if text and text.startswith("/image"):
+        prompt = text.replace("/image", "").strip()
+        if not check_limit(user_id):
+            send_message(chat_id, "🚫 Лимит исчерпан.")
+            return {"ok": True}
+
+        img = generate_image(prompt)
+        if img:
+            send_photo(chat_id, img)
+        else:
+            send_message(chat_id, "❌ Ошибка генерации.")
+        return {"ok": True}
+
+    # ===== AI =====
+
+    role, _ = get_user(user_id)
 
     if not check_limit(user_id):
-        send_message(chat_id,
-            "🚫 Лимит 20 сообщений в день.\n"
-            "Купите подписку: /buy")
+        send_message(chat_id, "🚫 Лимит сообщений исчерпан.")
         return {"ok": True}
-
-    increment_message_count(user_id)
 
     save_message(user_id, "user", text)
     history = get_memory(user_id)
@@ -245,8 +213,8 @@ async def webhook(request: Request):
     )
 
     reply = response.choices[0].message.content
-
     save_message(user_id, "assistant", reply)
+
     send_message(chat_id, reply)
 
     return {"ok": True}
