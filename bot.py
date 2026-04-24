@@ -9,13 +9,11 @@ app = FastAPI()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 groq = Groq(api_key=GROQ_API_KEY)
 
-ADMIN_ID = 6288084946  # ✅ ТВОЙ ID
-
+ADMIN_ID = 6288084946  # ТВОЙ ID
 FREE_LIMIT = 20
 
 # ===== БАЗА =====
@@ -85,21 +83,17 @@ def check_limit(user_id):
     conn.commit()
     return True
 
+# ✅ ГЕНЕРАЦИЯ БЕЗ РЕГИСТРАЦИИ
+
 def generate_image(prompt):
-    response = requests.post(
-        "https://api.stability.ai/v2beta/stable-image/generate/sd3",
-        headers={
-            "Authorization": f"Bearer {STABILITY_API_KEY}",
-            "Accept": "image/*"
-        },
-        files={
-            "prompt": (None, prompt),
-            "output_format": (None, "png"),
-        },
-    )
-    if response.status_code == 200:
-        return response.content
-    return None
+    try:
+        url = f"https://image.pollinations.ai/prompt/{prompt}"
+        response = requests.get(url, timeout=60)
+        if response.status_code == 200:
+            return response.content
+        return None
+    except:
+        return None
 
 # ===== WEBHOOK =====
 
@@ -126,17 +120,11 @@ async def webhook(request: Request):
                      main_menu())
         return {"ok": True}
 
-    # ===== ADMIN PANEL =====
+    # ===== ADMIN =====
     if text == "/users" and user_id == ADMIN_ID:
         cursor.execute("SELECT COUNT(*) FROM users")
         total = cursor.fetchone()[0]
-        send_message(chat_id, f"👥 Всего пользователей: {total}", main_menu())
-        return {"ok": True}
-
-    if text == "/admin_stats" and user_id == ADMIN_ID:
-        cursor.execute("SELECT SUM(count) FROM usage")
-        total = cursor.fetchone()[0] or 0
-        send_message(chat_id, f"📊 Всего использовано сообщений: {total}", main_menu())
+        send_message(chat_id, f"👥 Пользователей: {total}", main_menu())
         return {"ok": True}
 
     # ===== STATS =====
@@ -149,7 +137,7 @@ async def webhook(request: Request):
     # ===== BUY =====
     if text == "/buy":
         send_message(chat_id,
-                     "💎 Подписка уберёт лимит.\n"
+                     "💎 Подписка убирает лимит.\n"
                      "Напишите администратору.",
                      main_menu())
         return {"ok": True}
@@ -175,7 +163,7 @@ async def webhook(request: Request):
 
         return {"ok": True}
 
-    # ===== AI =====
+    # ===== AI ТЕКСТ =====
 
     if not check_limit(user_id):
         send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
@@ -194,7 +182,7 @@ async def webhook(request: Request):
         reply = response.choices[0].message.content
         send_message(chat_id, reply, main_menu())
 
-    except Exception:
+    except:
         send_message(chat_id, "⚠ Ошибка AI", main_menu())
 
     return {"ok": True}
