@@ -17,7 +17,7 @@ groq = Groq(api_key=GROQ_API_KEY)
 ADMIN_ID = 6288084946
 FREE_LIMIT = 20
 
-# ===== БАЗА ДАННЫХ =====
+# ===== БАЗА =====
 
 conn = sqlite3.connect("bot.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -25,6 +25,7 @@ cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
+    role TEXT DEFAULT 'ассистент',
     message_count INTEGER DEFAULT 0
 )
 """)
@@ -40,15 +41,28 @@ CREATE TABLE IF NOT EXISTS usage (
 
 conn.commit()
 
+# ===== РОЛИ (только нужные) =====
+
+ROLES = {
+    "ассистент": "Ты дружелюбный и полезный AI ассистент. Отвечай на русском.",
+    "программист": "Ты опытный программист. Помогай с кодом и объясняй.",
+    "учитель": "Ты терпеливый учитель. Объясняй просто и с примерами."
+}
+
 # ===== МЕНЮ =====
 
 def main_menu():
     return {
-        "keyboard": [
-            ["/image", "/stats"],
-            ["/buy"]
-        ],
-        "resize_keyboard": True
+        "inline_keyboard": [
+            [
+                {"text": "🎭 Роли", "callback_data": "menu_roles"},
+                {"text": "🎨 Генерация картинок", "callback_data": "menu_image"}
+            ],
+            [
+                {"text": "🧠 Очистить память", "callback_data": "clear"},
+                {"text": "📊 Статистика", "callback_data": "stats"}
+            ]
+        ]
     }
 
 # ===== УТИЛИТЫ =====
@@ -62,15 +76,11 @@ def send_message(chat_id, text, reply_markup=None):
 def send_photo_by_url(chat_id, image_url):
     requests.post(
         f"{TELEGRAM_API}/sendPhoto",
-        json={
-            "chat_id": chat_id,
-            "photo": image_url
-        }
+        json={"chat_id": chat_id, "photo": image_url}
     )
 
 def check_limit(user_id):
     today = datetime.now().strftime("%Y-%m-%d")
-
     cursor.execute("SELECT count FROM usage WHERE user_id = ? AND date = ?", (user_id, today))
     result = cursor.fetchone()
 
@@ -86,6 +96,20 @@ def check_limit(user_id):
     conn.commit()
     return True
 
+def translate_to_english(text):
+    try:
+        response = groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Translate the following Russian text into a detailed English prompt for image generation. Only return the English prompt."},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=150,
+        )
+        return response.choices[0].message.content.strip()
+    except:
+        return text
+
 def generate_image_url(prompt):
     encoded = quote(prompt)
     return f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&nologo=true"
@@ -96,6 +120,45 @@ def generate_image_url(prompt):
 async def webhook(request: Request):
     data = await request.json()
 
+    if "callback_query" in data:
+        callback = data["callback_query"]
+        user_id = callback["from"]["id"]
+        chat_id = callback["message"]["chat"]["id"]
+        action = callback["data"]
+
+        requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
+
+        if action == "menu_roles":
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🧑‍💼 Ассистент", "callback_data": "role_ассистент"}],
+                    [{"text": "👨‍💻 Программист", "callback_data": "role_программист"}],
+                    [{"text": "📚 Учитель", "callback_data": "role_учитель"}]
+                ]
+            }
+            send_message(chat_id, "🎭 Выберите роль:", keyboard)
+
+        elif action.startswith("role_"):
+            role = action.replace("role_", "")
+            cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+            conn.commit()
+            send_message(chat_id, f"✅ Роль изменена на: {role}", main_menu())
+
+        elif action == "menu_image":
+            send_message(chat_id, "🎨 Напишите команду:\n/image ваше описание", main_menu())
+
+        elif action == "clear":
+            cursor.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
+            conn.commit()
+            send_message(chat_id, "🧠 Память очищена", main_menu())
+
+        elif action == "stats":
+            cursor.execute("SELECT SUM(count) FROM usage WHERE user_id = ?", (user_id,))
+            total = cursor.fetchone()[0] or 0
+            send_message(chat_id, f"📊 Сегодня использовано: {total}/{FREE_LIMIT}", main_menu())
+
+        return {"ok": True}
+
     if "message" not in data:
         return {"ok": True}
 
@@ -104,78 +167,45 @@ async def webhook(request: Request):
     user_id = message["from"]["id"]
     text = message.get("text")
 
-    if not text:
-        return {"ok": True}
-
-    # ===== START =====
     if text == "/start":
-        send_message(chat_id,
-                     "🤖 AI Bot PRO\n\n"
-                     "20 сообщений бесплатно в день.",
-                     main_menu())
+        send_message(chat_id, "🤖 Добро пожаловать в AI Bot PRO!", main_menu())
         return {"ok": True}
 
-    # ===== ADMIN =====
-    if text == "/users" and user_id == ADMIN_ID:
-        cursor.execute("SELECT COUNT(*) FROM users")
-        total = cursor.fetchone()[0]
-        send_message(chat_id, f"👥 Пользователей: {total}", main_menu())
-        return {"ok": True}
-
-    # ===== STATS =====
-    if text == "/stats":
-        cursor.execute("SELECT SUM(count) FROM usage WHERE user_id = ?", (user_id,))
-        total = cursor.fetchone()[0] or 0
-        send_message(chat_id, f"📊 Сегодня: {total}/{FREE_LIMIT}", main_menu())
-        return {"ok": True}
-
-    # ===== BUY =====
-    if text == "/buy":
-        send_message(chat_id,
-                     "💎 Подписка уберёт лимит.\n"
-                     "Напишите администратору.",
-                     main_menu())
-        return {"ok": True}
-
-    # ===== IMAGE =====
     if text.startswith("/image"):
         prompt = text.replace("/image", "").strip()
-
         if not prompt:
-            send_message(chat_id, "Напиши: /image кот в космосе", main_menu())
+            send_message(chat_id, "Напишите: /image описание картинки", main_menu())
             return {"ok": True}
 
         if not check_limit(user_id):
-            send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
+            send_message(chat_id, "🚫 Лимит сообщений исчерпан.", main_menu())
             return {"ok": True}
 
-        send_message(chat_id, "🎨 Генерирую...")
+        send_message(chat_id, "🎨 Генерирую картинку...")
 
-        image_url = generate_image_url(prompt)
+        english_prompt = translate_to_english(prompt)
+        image_url = generate_image_url(english_prompt)
         send_photo_by_url(chat_id, image_url)
-
         return {"ok": True}
 
-    # ===== AI ТЕКСТ =====
-
+    # AI ответ
     if not check_limit(user_id):
         send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
         return {"ok": True}
 
-    try:
-        response = groq.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Ты полезный AI ассистент."},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=600,
-        )
+    role = cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    role = role[0] if role else "ассистент"
 
-        reply = response.choices[0].message.content
-        send_message(chat_id, reply, main_menu())
+    response = groq.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": ROLES[role]},
+            {"role": "user", "content": text}
+        ],
+        max_tokens=700,
+    )
 
-    except:
-        send_message(chat_id, "⚠ Ошибка AI", main_menu())
+    reply = response.choices[0].message.content
+    send_message(chat_id, reply, main_menu())
 
     return {"ok": True}
