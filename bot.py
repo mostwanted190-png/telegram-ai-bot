@@ -14,10 +14,9 @@ STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 groq = Groq(api_key=GROQ_API_KEY)
 
-ADMIN_ID = 6288084946
+ADMIN_ID = 6288084946  # ✅ ТВОЙ ID
 
 FREE_LIMIT = 20
-PREMIUM_LIMIT = 100
 
 # ===== БАЗА =====
 
@@ -27,18 +26,7 @@ cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
-    role TEXT DEFAULT 'ассистент',
-    message_count INTEGER DEFAULT 0,
-    tier INTEGER DEFAULT 0
-)
-""")
-
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS memory (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    role TEXT,
-    content TEXT
+    message_count INTEGER DEFAULT 0
 )
 """)
 
@@ -53,14 +41,16 @@ CREATE TABLE IF NOT EXISTS usage (
 
 conn.commit()
 
-ROLES = {
-    "ассистент": "Ты дружелюбный AI ассистент.",
-    "программист": "Ты опытный программист.",
-    "учитель": "Ты объясняешь просто.",
-    "шутник": "Ты отвечаешь с юмором.",
-    "психолог": "Ты поддерживаешь.",
-    "художник": "Ты создаёшь детальные промпты для генерации изображений."
-}
+# ===== МЕНЮ =====
+
+def main_menu():
+    return {
+        "keyboard": [
+            ["/image", "/stats"],
+            ["/buy"]
+        ],
+        "resize_keyboard": True
+    }
 
 # ===== УТИЛИТЫ =====
 
@@ -76,6 +66,24 @@ def send_photo(chat_id, image_bytes):
         files={"photo": ("image.png", image_bytes)},
         data={"chat_id": chat_id}
     )
+
+def check_limit(user_id):
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    cursor.execute("SELECT count FROM usage WHERE user_id = ? AND date = ?", (user_id, today))
+    result = cursor.fetchone()
+
+    if not result:
+        cursor.execute("INSERT INTO usage VALUES (?, ?, 1)", (user_id, today))
+        conn.commit()
+        return True
+
+    if result[0] >= FREE_LIMIT:
+        return False
+
+    cursor.execute("UPDATE usage SET count = count + 1 WHERE user_id = ? AND date = ?", (user_id, today))
+    conn.commit()
+    return True
 
 def generate_image(prompt):
     response = requests.post(
@@ -93,51 +101,6 @@ def generate_image(prompt):
         return response.content
     return None
 
-def get_user(user_id):
-    cursor.execute("SELECT role, tier FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    if not result:
-        cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
-        conn.commit()
-        return "ассистент", 0
-    return result
-
-def check_limit(user_id):
-    today = datetime.now().strftime("%Y-%m-%d")
-    cursor.execute("SELECT tier FROM users WHERE user_id = ?", (user_id,))
-    tier = cursor.fetchone()[0]
-
-    if tier == 2:
-        return True
-
-    limit = FREE_LIMIT if tier == 0 else PREMIUM_LIMIT
-
-    cursor.execute("SELECT count FROM usage WHERE user_id = ? AND date = ?", (user_id, today))
-    result = cursor.fetchone()
-
-    if not result:
-        cursor.execute("INSERT INTO usage VALUES (?, ?, 1)", (user_id, today))
-        conn.commit()
-        return True
-
-    if result[0] >= limit:
-        return False
-
-    cursor.execute("UPDATE usage SET count = count + 1 WHERE user_id = ? AND date = ?", (user_id, today))
-    conn.commit()
-    return True
-
-def save_message(user_id, role, content):
-    cursor.execute("INSERT INTO memory (user_id, role, content) VALUES (?, ?, ?)",
-                   (user_id, role, content))
-    conn.commit()
-
-def get_memory(user_id):
-    cursor.execute("SELECT role, content FROM memory WHERE user_id = ? ORDER BY id DESC LIMIT 10",
-                   (user_id,))
-    rows = cursor.fetchall()
-    return [{"role": r, "content": c} for r, c in reversed(rows)]
-
 # ===== WEBHOOK =====
 
 @app.post("/")
@@ -152,69 +115,86 @@ async def webhook(request: Request):
     user_id = message["from"]["id"]
     text = message.get("text")
 
+    if not text:
+        return {"ok": True}
+
+    # ===== START =====
     if text == "/start":
         send_message(chat_id,
-                     "🤖 AI Бот PRO\n\n"
-                     "/image — генерация изображения\n"
-                     "/buy — подписка\n"
-                     "/stats — статистика")
+                     "🤖 AI Bot PRO\n\n"
+                     "20 сообщений бесплатно в день.",
+                     main_menu())
         return {"ok": True}
 
-    if text == "/buy":
-        send_message(chat_id,
-                     "💎 Подписка PRO:\n"
-                     "• 100 сообщений — Premium\n"
-                     "• Безлимит — PRO\n\n"
-                     "Свяжитесь с администратором.")
-        return {"ok": True}
-
+    # ===== ADMIN PANEL =====
     if text == "/users" and user_id == ADMIN_ID:
         cursor.execute("SELECT COUNT(*) FROM users")
         total = cursor.fetchone()[0]
-        send_message(chat_id, f"👥 Пользователей: {total}")
+        send_message(chat_id, f"👥 Всего пользователей: {total}", main_menu())
         return {"ok": True}
 
-    if text == "/stats" and user_id == ADMIN_ID:
-        cursor.execute("SELECT SUM(message_count) FROM users")
+    if text == "/admin_stats" and user_id == ADMIN_ID:
+        cursor.execute("SELECT SUM(count) FROM usage")
         total = cursor.fetchone()[0] or 0
-        send_message(chat_id, f"📊 Всего сообщений: {total}")
+        send_message(chat_id, f"📊 Всего использовано сообщений: {total}", main_menu())
         return {"ok": True}
 
-    if text and text.startswith("/image"):
+    # ===== STATS =====
+    if text == "/stats":
+        cursor.execute("SELECT SUM(count) FROM usage WHERE user_id = ?", (user_id,))
+        total = cursor.fetchone()[0] or 0
+        send_message(chat_id, f"📊 Сегодня использовано: {total}/{FREE_LIMIT}", main_menu())
+        return {"ok": True}
+
+    # ===== BUY =====
+    if text == "/buy":
+        send_message(chat_id,
+                     "💎 Подписка уберёт лимит.\n"
+                     "Напишите администратору.",
+                     main_menu())
+        return {"ok": True}
+
+    # ===== IMAGE =====
+    if text.startswith("/image"):
         prompt = text.replace("/image", "").strip()
+
+        if not prompt:
+            send_message(chat_id, "Напиши: /image кот в космосе", main_menu())
+            return {"ok": True}
+
         if not check_limit(user_id):
-            send_message(chat_id, "🚫 Лимит исчерпан.")
+            send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
             return {"ok": True}
 
         img = generate_image(prompt)
+
         if img:
             send_photo(chat_id, img)
         else:
-            send_message(chat_id, "❌ Ошибка генерации.")
+            send_message(chat_id, "❌ Ошибка генерации.", main_menu())
+
         return {"ok": True}
 
     # ===== AI =====
 
-    role, _ = get_user(user_id)
-
     if not check_limit(user_id):
-        send_message(chat_id, "🚫 Лимит сообщений исчерпан.")
+        send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
         return {"ok": True}
 
-    save_message(user_id, "user", text)
-    history = get_memory(user_id)
+    try:
+        response = groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": "Ты полезный AI ассистент."},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=600,
+        )
 
-    messages = [{"role": "system", "content": ROLES[role]}] + history
+        reply = response.choices[0].message.content
+        send_message(chat_id, reply, main_menu())
 
-    response = groq.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages,
-        max_tokens=800,
-    )
-
-    reply = response.choices[0].message.content
-    save_message(user_id, "assistant", reply)
-
-    send_message(chat_id, reply)
+    except Exception:
+        send_message(chat_id, "⚠ Ошибка AI", main_menu())
 
     return {"ok": True}
