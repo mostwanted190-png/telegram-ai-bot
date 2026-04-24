@@ -19,11 +19,14 @@ user_roles = {}
 MAX_HISTORY = 10
 
 ROLES = {
-    "assistant": "Ты дружелюбный AI ассистент. Отвечай на русском.",
-    "programmer": "Ты опытный программист. Помогай писать код.",
-    "teacher": "Ты учитель. Объясняй просто и понятно.",
-    "joker": "Ты шутишь и отвечаешь с юмором.",
-    "psychologist": "Ты поддерживающий психолог.",
+    "ассистент": "Ты дружелюбный и полезный AI ассистент. Отвечай на русском.",
+    "программист": "Ты опытный программист. Помогай писать код и объяснять концепции.",
+    "учитель": "Ты терпеливый учитель. Объясняй просто и понятно с примерами.",
+    "шутник": "Ты весёлый и остроумный шутник. Отвечай с юмором и каламбурами.",
+    "психолог": "Ты добрый и поддерживающий психолог. Помогай разобраться в чувствах.",
+    "писатель": "Ты талантливый писатель. Помогай сочинять тексты и истории.",
+    "переводчик": "Ты профессиональный переводчик. Переводи тексты на любой язык.",
+    "английский": "You are an English teacher. Help learn English. Correct mistakes gently.",
 }
 
 # ===== УТИЛИТА ОТПРАВКИ =====
@@ -52,28 +55,38 @@ async def webhook(request: Request):
     if text == "/start":
         send_message(chat_id,
                      "🤖 AI Бот активен!\n\n"
+                     "Команды:\n"
                      "/role — сменить роль\n"
-                     "/roles — список ролей")
+                     "/roles — список ролей\n"
+                     "/clear — очистить память\n"
+                     "/note текст — сохранить заметку\n"
+                     "/notes — мои заметки")
+        return {"ok": True}
+
+    if text == "/clear":
+        user_memory[user_id] = []
+        send_message(chat_id, "🧹 Память очищена!")
         return {"ok": True}
 
     if text == "/roles":
-        roles_list = "\n".join(ROLES.keys())
-        send_message(chat_id, f"Доступные роли:\n{roles_list}")
+        roles_list = "\n".join([f"• {r}" for r in ROLES.keys()])
+        send_message(chat_id, f"🎭 Доступные роли:\n\n{roles_list}\n\nВыбери: /role имя")
         return {"ok": True}
 
     if text.startswith("/role"):
-        parts = text.split()
+        parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            send_message(chat_id, "Использование: /role assistant")
+            send_message(chat_id, "Использование: /role ассистент")
             return {"ok": True}
 
-        role = parts[1]
+        role = parts[1].strip().lower()
         if role not in ROLES:
-            send_message(chat_id, "Такой роли нет.")
+            send_message(chat_id, "Такой роли нет.\nНапиши /roles чтобы увидеть список.")
             return {"ok": True}
 
         user_roles[user_id] = role
-        send_message(chat_id, f"✅ Роль изменена на {role}")
+        user_memory[user_id] = []
+        send_message(chat_id, f"✅ Роль изменена на: {role}\nПамять очищена. Начинай!")
         return {"ok": True}
 
     # ===== AI ЛОГИКА =====
@@ -81,7 +94,7 @@ async def webhook(request: Request):
     if user_id not in user_memory:
         user_memory[user_id] = []
 
-    role = user_roles.get(user_id, "assistant")
+    role = user_roles.get(user_id, "ассистент")
     system_prompt = ROLES[role]
 
     user_memory[user_id].append({"role": "user", "content": text})
