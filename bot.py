@@ -2,6 +2,7 @@ import os
 import sqlite3
 import requests
 from datetime import datetime
+from urllib.parse import quote
 from fastapi import FastAPI, Request
 from groq import Groq
 
@@ -83,23 +84,18 @@ def check_limit(user_id):
     conn.commit()
     return True
 
-# ===== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (без регистрации) =====
+# ===== ГЕНЕРАЦИЯ КАРТИНОК =====
 
 def generate_image(prompt):
     try:
-        response = requests.post(
-            "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2",
-            headers={"Content-Type": "application/json"},
-            json={"inputs": prompt},
-            timeout=120
-        )
-
-        if response.status_code == 200:
+        encoded = quote(prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&nologo=true&seed=42"
+        response = requests.get(url, timeout=120, allow_redirects=True)
+        if response.status_code == 200 and len(response.content) > 1000:
             return response.content
-
         return None
-
-    except:
+    except Exception as e:
+        print(f"Image error: {e}")
         return None
 
 # ===== WEBHOOK =====
@@ -123,7 +119,10 @@ async def webhook(request: Request):
     if text == "/start":
         send_message(chat_id,
                      "🤖 AI Bot PRO\n\n"
-                     "20 сообщений бесплатно в день.",
+                     "20 сообщений бесплатно в день.\n\n"
+                     "/image — генерация картинки\n"
+                     "/stats — статистика\n"
+                     "/buy — подписка",
                      main_menu())
         return {"ok": True}
 
@@ -138,7 +137,7 @@ async def webhook(request: Request):
     if text == "/stats":
         cursor.execute("SELECT SUM(count) FROM usage WHERE user_id = ?", (user_id,))
         total = cursor.fetchone()[0] or 0
-        send_message(chat_id, f"📊 Сегодня использовано: {total}/{FREE_LIMIT}", main_menu())
+        send_message(chat_id, f"📊 Сегодня: {total}/{FREE_LIMIT}", main_menu())
         return {"ok": True}
 
     # ===== BUY =====
@@ -161,12 +160,14 @@ async def webhook(request: Request):
             send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
             return {"ok": True}
 
+        send_message(chat_id, "🎨 Генерирую...")
+
         img = generate_image(prompt)
 
         if img:
             send_photo(chat_id, img)
         else:
-            send_message(chat_id, "❌ Ошибка генерации.", main_menu())
+            send_message(chat_id, "❌ Ошибка генерации. Попробуй позже.", main_menu())
 
         return {"ok": True}
 
