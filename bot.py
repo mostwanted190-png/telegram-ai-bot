@@ -13,10 +13,10 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 groq = Groq(api_key=GROQ_API_KEY)
 
-ADMIN_ID = 6288084946  # ТВОЙ ID
+ADMIN_ID = 6288084946
 FREE_LIMIT = 20
 
-# ===== БАЗА =====
+# ===== БАЗА ДАННЫХ =====
 
 conn = sqlite3.connect("bot.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -83,15 +83,22 @@ def check_limit(user_id):
     conn.commit()
     return True
 
-# ✅ ГЕНЕРАЦИЯ БЕЗ РЕГИСТРАЦИИ
+# ===== ГЕНЕРАЦИЯ ИЗОБРАЖЕНИЙ (без регистрации) =====
 
 def generate_image(prompt):
     try:
-        url = f"https://image.pollinations.ai/prompt/{prompt}"
-        response = requests.get(url, timeout=60)
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-2",
+            headers={"Content-Type": "application/json"},
+            json={"inputs": prompt},
+            timeout=120
+        )
+
         if response.status_code == 200:
             return response.content
+
         return None
+
     except:
         return None
 
@@ -137,7 +144,7 @@ async def webhook(request: Request):
     # ===== BUY =====
     if text == "/buy":
         send_message(chat_id,
-                     "💎 Подписка убирает лимит.\n"
+                     "💎 Подписка уберёт лимит.\n"
                      "Напишите администратору.",
                      main_menu())
         return {"ok": True}
