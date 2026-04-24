@@ -59,11 +59,13 @@ def send_message(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
-def send_photo(chat_id, image_bytes):
+def send_photo_by_url(chat_id, image_url):
     requests.post(
         f"{TELEGRAM_API}/sendPhoto",
-        files={"photo": ("image.png", image_bytes)},
-        data={"chat_id": chat_id}
+        json={
+            "chat_id": chat_id,
+            "photo": image_url
+        }
     )
 
 def check_limit(user_id):
@@ -84,19 +86,9 @@ def check_limit(user_id):
     conn.commit()
     return True
 
-# ===== ГЕНЕРАЦИЯ КАРТИНОК =====
-
-def generate_image(prompt):
-    try:
-        encoded = quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&nologo=true&seed=42"
-        response = requests.get(url, timeout=120, allow_redirects=True)
-        if response.status_code == 200 and len(response.content) > 1000:
-            return response.content
-        return None
-    except Exception as e:
-        print(f"Image error: {e}")
-        return None
+def generate_image_url(prompt):
+    encoded = quote(prompt)
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&nologo=true"
 
 # ===== WEBHOOK =====
 
@@ -119,10 +111,7 @@ async def webhook(request: Request):
     if text == "/start":
         send_message(chat_id,
                      "🤖 AI Bot PRO\n\n"
-                     "20 сообщений бесплатно в день.\n\n"
-                     "/image — генерация картинки\n"
-                     "/stats — статистика\n"
-                     "/buy — подписка",
+                     "20 сообщений бесплатно в день.",
                      main_menu())
         return {"ok": True}
 
@@ -162,12 +151,8 @@ async def webhook(request: Request):
 
         send_message(chat_id, "🎨 Генерирую...")
 
-        img = generate_image(prompt)
-
-        if img:
-            send_photo(chat_id, img)
-        else:
-            send_message(chat_id, "❌ Ошибка генерации. Попробуй позже.", main_menu())
+        image_url = generate_image_url(prompt)
+        send_photo_by_url(chat_id, image_url)
 
         return {"ok": True}
 
