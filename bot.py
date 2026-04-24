@@ -41,12 +41,12 @@ CREATE TABLE IF NOT EXISTS usage (
 
 conn.commit()
 
-# ===== РОЛИ (только нужные) =====
+# ===== РОЛИ =====
 
 ROLES = {
-    "ассистент": "Ты дружелюбный и полезный AI ассистент. Отвечай на русском.",
-    "программист": "Ты опытный программист. Помогай с кодом и объясняй.",
-    "учитель": "Ты терпеливый учитель. Объясняй просто и с примерами."
+    "ассистент": "Ты дружелюбный и полезный AI ассистент.",
+    "программист": "Ты опытный программист.",
+    "учитель": "Ты терпеливый учитель."
 }
 
 # ===== МЕНЮ =====
@@ -80,7 +80,12 @@ def send_photo_by_url(chat_id, image_url):
     )
 
 def check_limit(user_id):
+    # ✅ Админ без лимита
+    if user_id == ADMIN_ID:
+        return True
+
     today = datetime.now().strftime("%Y-%m-%d")
+
     cursor.execute("SELECT count FROM usage WHERE user_id = ? AND date = ?", (user_id, today))
     result = cursor.fetchone()
 
@@ -101,7 +106,7 @@ def translate_to_english(text):
         response = groq.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "Translate the following Russian text into a detailed English prompt for image generation. Only return the English prompt."},
+                {"role": "system", "content": "Translate this Russian text into a detailed English prompt for image generation. Only return the prompt."},
                 {"role": "user", "content": text}
             ],
             max_tokens=150,
@@ -126,7 +131,8 @@ async def webhook(request: Request):
         chat_id = callback["message"]["chat"]["id"]
         action = callback["data"]
 
-        requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback["id"]})
+        requests.post(f"{TELEGRAM_API}/answerCallbackQuery",
+                      json={"callback_query_id": callback["id"]})
 
         if action == "menu_roles":
             keyboard = {
@@ -145,17 +151,16 @@ async def webhook(request: Request):
             send_message(chat_id, f"✅ Роль изменена на: {role}", main_menu())
 
         elif action == "menu_image":
-            send_message(chat_id, "🎨 Напишите команду:\n/image ваше описание", main_menu())
+            send_message(chat_id, "🎨 Используйте:\n/image описание", main_menu())
 
         elif action == "clear":
-            cursor.execute("DELETE FROM memory WHERE user_id = ?", (user_id,))
-            conn.commit()
             send_message(chat_id, "🧠 Память очищена", main_menu())
 
         elif action == "stats":
-            cursor.execute("SELECT SUM(count) FROM usage WHERE user_id = ?", (user_id,))
-            total = cursor.fetchone()[0] or 0
-            send_message(chat_id, f"📊 Сегодня использовано: {total}/{FREE_LIMIT}", main_menu())
+            cursor.execute("SELECT count FROM usage WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            count = result[0] if result else 0
+            send_message(chat_id, f"📊 Сегодня: {count}/{FREE_LIMIT}", main_menu())
 
         return {"ok": True}
 
@@ -168,27 +173,21 @@ async def webhook(request: Request):
     text = message.get("text")
 
     if text == "/start":
-        send_message(chat_id, "🤖 Добро пожаловать в AI Bot PRO!", main_menu())
+        send_message(chat_id, "🤖 Добро пожаловать!", main_menu())
         return {"ok": True}
 
     if text.startswith("/image"):
         prompt = text.replace("/image", "").strip()
-        if not prompt:
-            send_message(chat_id, "Напишите: /image описание картинки", main_menu())
-            return {"ok": True}
 
         if not check_limit(user_id):
-            send_message(chat_id, "🚫 Лимит сообщений исчерпан.", main_menu())
+            send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
             return {"ok": True}
-
-        send_message(chat_id, "🎨 Генерирую картинку...")
 
         english_prompt = translate_to_english(prompt)
         image_url = generate_image_url(english_prompt)
         send_photo_by_url(chat_id, image_url)
         return {"ok": True}
 
-    # AI ответ
     if not check_limit(user_id):
         send_message(chat_id, "🚫 Лимит исчерпан.", main_menu())
         return {"ok": True}
