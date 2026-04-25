@@ -42,20 +42,30 @@ ROLES = {
     "учитель": "Ты терпеливый учитель."
 }
 
-# ===== МЕНЮ =====
+# ===== ГЛАВНОЕ МЕНЮ (обычные кнопки) =====
 
 def main_menu(is_admin=False):
     keyboard = [
         ["🎭 Роли", "🎨 Картинка"],
         ["📊 Статистика", "💎 Подписка"]
     ]
-
     if is_admin:
         keyboard.append(["⚙ Админ-панель"])
 
     return {
         "keyboard": keyboard,
         "resize_keyboard": True
+    }
+
+# ===== INLINE КНОПКИ РОЛЕЙ =====
+
+def roles_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "🧑‍💼 Ассистент", "callback_data": "role_ассистент"}],
+            [{"text": "👨‍💻 Программист", "callback_data": "role_программист"}],
+            [{"text": "📚 Учитель", "callback_data": "role_учитель"}]
+        ]
     }
 
 # ===== УТИЛИТЫ =====
@@ -66,14 +76,14 @@ def send_message(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
-def send_photo_by_url(chat_id, image_url):
+def answer_callback(callback_id):
     requests.post(
-        f"{TELEGRAM_API}/sendPhoto",
-        json={"chat_id": chat_id, "photo": image_url}
+        f"{TELEGRAM_API}/answerCallbackQuery",
+        json={"callback_query_id": callback_id}
     )
 
 def get_user(user_id):
-    cursor.execute("SELECT role, message_count, subscription_until, reset_time FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
     if not result:
         reset = (datetime.now() + timedelta(hours=24)).isoformat()
@@ -82,56 +92,34 @@ def get_user(user_id):
             (user_id, reset)
         )
         conn.commit()
-        return "ассистент", 0, None, reset
-    return result
-
-def is_subscription_active(subscription_until):
-    if not subscription_until:
-        return False
-    return datetime.now() < datetime.fromisoformat(subscription_until)
-
-def check_limit(user_id):
-    if user_id == ADMIN_ID:
-        return True, None
-
-    role, message_count, subscription_until, reset_time = get_user(user_id)
-
-    if is_subscription_active(subscription_until):
-        return True, None
-
-    now = datetime.now()
-    reset_dt = datetime.fromisoformat(reset_time)
-
-    if now >= reset_dt:
-        new_reset = (now + timedelta(hours=24)).isoformat()
-        cursor.execute(
-            "UPDATE users SET message_count = 0, reset_time = ? WHERE user_id = ?",
-            (new_reset, user_id)
-        )
-        conn.commit()
-        return True, None
-
-    if message_count >= FREE_LIMIT:
-        remaining = reset_dt - now
-        return False, remaining
-
-    cursor.execute(
-        "UPDATE users SET message_count = message_count + 1 WHERE user_id = ?",
-        (user_id,)
-    )
-    conn.commit()
-
-    return True, None
-
-def generate_image_url(prompt):
-    encoded = quote(prompt)
-    return f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&nologo=true"
+        return "ассистент"
+    return result[0]
 
 # ===== WEBHOOK =====
 
 @app.post("/")
 async def webhook(request: Request):
     data = await request.json()
+
+    # ===== ОБРАБОТКА CALLBACK =====
+
+    if "callback_query" in data:
+        callback = data["callback_query"]
+        user_id = callback["from"]["id"]
+        chat_id = callback["message"]["chat"]["id"]
+        action = callback["data"]
+
+        answer_callback(callback["id"])
+
+        if action.startswith("role_"):
+            role = action.replace("role_", "")
+            cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+            conn.commit()
+            send_message(chat_id, f"✅ Роль изменена на: {role}", main_menu(is_admin=(user_id == ADMIN_ID)))
+
+        return {"ok": True}
+
+    # ===== ОБЫЧНЫЕ СООБЩЕНИЯ =====
 
     if "message" not in data:
         return {"ok": True}
@@ -142,88 +130,20 @@ async def webhook(request: Request):
     text = message.get("text")
 
     if text == "/start":
-        send_message(
-            chat_id,
-            "🤖 Добро пожаловать!",
-            main_menu(is_admin=(user_id == ADMIN_ID))
-        )
+        send_message(chat_id, "🤖 Добро пожаловать!", main_menu(is_admin=(user_id == ADMIN_ID)))
         return {"ok": True}
 
     if text == "🎭 Роли":
-        roles_text = "Доступные роли:\n"
-        for r in ROLES:
-            roles_text += f"- {r}\n"
-        roles_text += "\nНапишите: роль ассистент"
-        send_message(chat_id, roles_text, main_menu(is_admin=(user_id == ADMIN_ID)))
-        return {"ok": True}
-
-    if text.startswith("роль "):
-        role_name = text.replace("роль ", "").strip()
-        if role_name in ROLES:
-            cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role_name, user_id))
-            conn.commit()
-            send_message(chat_id, f"✅ Роль изменена на: {role_name}", main_menu(is_admin=(user_id == ADMIN_ID)))
-        else:
-            send_message(chat_id, "❌ Такой роли нет.", main_menu(is_admin=(user_id == ADMIN_ID)))
-        return {"ok": True}
-
-    if text == "🎨 Картинка":
-        send_message(chat_id, "Напишите: /image описание", main_menu(is_admin=(user_id == ADMIN_ID)))
-        return {"ok": True}
-
-    if text and text.startswith("/image"):
-        allowed, remaining = check_limit(user_id)
-
-        if not allowed:
-            hours = remaining.seconds // 3600
-            minutes = (remaining.seconds % 3600) // 60
-            send_message(chat_id,
-                         f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
-                         main_menu(is_admin=(user_id == ADMIN_ID)))
-            return {"ok": True}
-
-        prompt = text.replace("/image", "").strip()
-        image_url = generate_image_url(prompt)
-        send_photo_by_url(chat_id, image_url)
-        return {"ok": True}
-
-    if text == "📊 Статистика":
-        role, message_count, subscription_until, reset_time = get_user(user_id)
-        if is_subscription_active(subscription_until):
-            text = f"💎 Подписка активна до: {subscription_until[:10]}"
-        else:
-            reset_dt = datetime.fromisoformat(reset_time)
-            text = f"📊 Использовано: {message_count}/{FREE_LIMIT}\n⏳ Сброс: {reset_dt.strftime('%d.%m %H:%M')}"
-        send_message(chat_id, text, main_menu(is_admin=(user_id == ADMIN_ID)))
-        return {"ok": True}
-
-    if text == "💎 Подписка":
-        send_message(chat_id, "Напишите администратору для подключения PRO.", main_menu(is_admin=(user_id == ADMIN_ID)))
+        send_message(chat_id, "Выберите роль:", roles_keyboard())
         return {"ok": True}
 
     if text == "⚙ Админ-панель" and user_id == ADMIN_ID:
-        send_message(chat_id, "Выдача PRO: напишите /give_sub USER_ID", main_menu(is_admin=True))
+        send_message(chat_id, "Админ активен ✅", main_menu(is_admin=True))
         return {"ok": True}
 
-    if text and text.startswith("/give_sub") and user_id == ADMIN_ID:
-        target = int(text.split()[1])
-        sub_until = (datetime.now() + timedelta(days=30)).isoformat()
-        cursor.execute("UPDATE users SET subscription_until = ? WHERE user_id = ?", (sub_until, target))
-        conn.commit()
-        send_message(chat_id, f"✅ PRO выдан до {sub_until[:10]}", main_menu(is_admin=True))
-        return {"ok": True}
+    # ===== AI =====
 
-    # AI
-    allowed, remaining = check_limit(user_id)
-    if not allowed:
-        hours = remaining.seconds // 3600
-        minutes = (remaining.seconds % 3600) // 60
-        send_message(chat_id,
-                     f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
-                     main_menu(is_admin=(user_id == ADMIN_ID)))
-        return {"ok": True}
-
-    role, _, _, _ = get_user(user_id)
+    role = get_user(user_id)
 
     response = groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
