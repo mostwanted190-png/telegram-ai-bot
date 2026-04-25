@@ -27,7 +27,6 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     role TEXT DEFAULT 'ассистент',
     message_count INTEGER DEFAULT 0,
-    subscription_until TEXT,
     reset_time TEXT
 )
 """)
@@ -42,22 +41,19 @@ ROLES = {
     "учитель": "Ты терпеливый учитель."
 }
 
-# ===== ГЛАВНОЕ МЕНЮ (обычные кнопки) =====
+# ===== МЕНЮ =====
 
 def main_menu(is_admin=False):
     keyboard = [
         ["🎭 Роли", "🎨 Картинка"],
-        ["📊 Статистика", "💎 Подписка"]
+        ["📊 Статистика"]
     ]
     if is_admin:
         keyboard.append(["⚙ Админ-панель"])
-
     return {
         "keyboard": keyboard,
         "resize_keyboard": True
     }
-
-# ===== INLINE КНОПКИ РОЛЕЙ =====
 
 def roles_keyboard():
     return {
@@ -76,6 +72,12 @@ def send_message(chat_id, text, reply_markup=None):
         payload["reply_markup"] = reply_markup
     requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
+def send_photo_by_url(chat_id, image_url):
+    requests.post(
+        f"{TELEGRAM_API}/sendPhoto",
+        json={"chat_id": chat_id, "photo": image_url}
+    )
+
 def answer_callback(callback_id):
     requests.post(
         f"{TELEGRAM_API}/answerCallbackQuery",
@@ -83,7 +85,7 @@ def answer_callback(callback_id):
     )
 
 def get_user(user_id):
-    cursor.execute("SELECT role FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT role, message_count, reset_time FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
     if not result:
         reset = (datetime.now() + timedelta(hours=24)).isoformat()
@@ -92,8 +94,43 @@ def get_user(user_id):
             (user_id, reset)
         )
         conn.commit()
-        return "ассистент"
-    return result[0]
+        return "ассистент", 0, reset
+    return result
+
+def increment_message_count(user_id):
+    cursor.execute(
+        "UPDATE users SET message_count = message_count + 1 WHERE user_id = ?",
+        (user_id,)
+    )
+    conn.commit()
+
+def check_limit(user_id):
+    if user_id == ADMIN_ID:
+        return True, None
+
+    role, message_count, reset_time = get_user(user_id)
+
+    now = datetime.now()
+    reset_dt = datetime.fromisoformat(reset_time)
+
+    if now >= reset_dt:
+        new_reset = (now + timedelta(hours=24)).isoformat()
+        cursor.execute(
+            "UPDATE users SET message_count = 0, reset_time = ? WHERE user_id = ?",
+            (new_reset, user_id)
+        )
+        conn.commit()
+        return True, None
+
+    if message_count >= FREE_LIMIT:
+        remaining = reset_dt - now
+        return False, remaining
+
+    return True, None
+
+def generate_image_url(prompt):
+    encoded = quote(prompt)
+    return f"https://image.pollinations.ai/prompt/{encoded}?width=768&height=768&nologo=true"
 
 # ===== WEBHOOK =====
 
@@ -101,8 +138,7 @@ def get_user(user_id):
 async def webhook(request: Request):
     data = await request.json()
 
-    # ===== ОБРАБОТКА CALLBACK =====
-
+    # CALLBACK
     if "callback_query" in data:
         callback = data["callback_query"]
         user_id = callback["from"]["id"]
@@ -118,8 +154,6 @@ async def webhook(request: Request):
             send_message(chat_id, f"✅ Роль изменена на: {role}", main_menu(is_admin=(user_id == ADMIN_ID)))
 
         return {"ok": True}
-
-    # ===== ОБЫЧНЫЕ СООБЩЕНИЯ =====
 
     if "message" not in data:
         return {"ok": True}
@@ -137,13 +171,55 @@ async def webhook(request: Request):
         send_message(chat_id, "Выберите роль:", roles_keyboard())
         return {"ok": True}
 
-    if text == "⚙ Админ-панель" and user_id == ADMIN_ID:
-        send_message(chat_id, "Админ активен ✅", main_menu(is_admin=True))
+    if text == "🎨 Картинка":
+        send_message(
+            chat_id,
+            "Чтобы сгенерировать картинку, используйте команду:\n\n"
+            "/image описание\n\n"
+            "Пример:\n"
+            "/image закат над морем",
+            main_menu(is_admin=(user_id == ADMIN_ID))
+        )
         return {"ok": True}
 
-    # ===== AI =====
+    if text.startswith("/image"):
+        allowed, remaining = check_limit(user_id)
+        if not allowed:
+            hours = remaining.seconds // 3600
+            minutes = (remaining.seconds % 3600) // 60
+            send_message(chat_id,
+                         f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
+                         main_menu(is_admin=(user_id == ADMIN_ID)))
+            return {"ok": True}
 
-    role = get_user(user_id)
+        prompt = text.replace("/image", "").strip()
+        image_url = generate_image_url(prompt)
+        send_photo_by_url(chat_id, image_url)
+        increment_message_count(user_id)
+        return {"ok": True}
+
+    if text == "📊 Статистика":
+        role, message_count, reset_time = get_user(user_id)
+        reset_dt = datetime.fromisoformat(reset_time)
+        send_message(
+            chat_id,
+            f"📊 Сообщений сегодня: {message_count}/{FREE_LIMIT}\n"
+            f"⏳ Сброс: {reset_dt.strftime('%d.%m %H:%M')}",
+            main_menu(is_admin=(user_id == ADMIN_ID))
+        )
+        return {"ok": True}
+
+    # AI
+    allowed, remaining = check_limit(user_id)
+    if not allowed:
+        hours = remaining.seconds // 3600
+        minutes = (remaining.seconds % 3600) // 60
+        send_message(chat_id,
+                     f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
+                     main_menu(is_admin=(user_id == ADMIN_ID)))
+        return {"ok": True}
+
+    role, _, _ = get_user(user_id)
 
     response = groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -155,6 +231,7 @@ async def webhook(request: Request):
     )
 
     reply = response.choices[0].message.content
+    increment_message_count(user_id)
     send_message(chat_id, reply, main_menu(is_admin=(user_id == ADMIN_ID)))
 
     return {"ok": True}
