@@ -27,7 +27,11 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     role TEXT DEFAULT 'ассистент',
     message_count INTEGER DEFAULT 0,
-    reset_time TEXT
+    subscription_until TEXT,
+    reset_time TEXT,
+    custom_limit INTEGER,
+    blocked INTEGER DEFAULT 0,
+    last_active TEXT
 )
 """)
 
@@ -50,19 +54,7 @@ def main_menu(is_admin=False):
     ]
     if is_admin:
         keyboard.append(["⚙ Админ-панель"])
-    return {
-        "keyboard": keyboard,
-        "resize_keyboard": True
-    }
-
-def roles_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "🧑‍💼 Ассистент", "callback_data": "role_ассистент"}],
-            [{"text": "👨‍💻 Программист", "callback_data": "role_программист"}],
-            [{"text": "📚 Учитель", "callback_data": "role_учитель"}]
-        ]
-    }
+    return {"keyboard": keyboard, "resize_keyboard": True}
 
 # ===== УТИЛИТЫ =====
 
@@ -78,37 +70,50 @@ def send_photo_by_url(chat_id, image_url):
         json={"chat_id": chat_id, "photo": image_url}
     )
 
-def answer_callback(callback_id):
-    requests.post(
-        f"{TELEGRAM_API}/answerCallbackQuery",
-        json={"callback_query_id": callback_id}
-    )
-
 def get_user(user_id):
-    cursor.execute("SELECT role, message_count, reset_time FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("""
+    SELECT role, message_count, subscription_until, reset_time,
+           custom_limit, blocked
+    FROM users WHERE user_id = ?
+    """, (user_id,))
     result = cursor.fetchone()
+
     if not result:
         reset = (datetime.now() + timedelta(hours=24)).isoformat()
         cursor.execute(
-            "INSERT INTO users (user_id, reset_time) VALUES (?, ?)",
-            (user_id, reset)
+            "INSERT INTO users (user_id, reset_time, last_active) VALUES (?, ?, ?)",
+            (user_id, reset, datetime.now().isoformat())
         )
         conn.commit()
-        return "ассистент", 0, reset
+        return "ассистент", 0, None, reset, None, 0
+
     return result
 
-def increment_message_count(user_id):
+def update_activity(user_id):
     cursor.execute(
-        "UPDATE users SET message_count = message_count + 1 WHERE user_id = ?",
-        (user_id,)
+        "UPDATE users SET last_active = ? WHERE user_id = ?",
+        (datetime.now().isoformat(), user_id)
     )
     conn.commit()
+
+def is_subscription_active(subscription_until):
+    if not subscription_until:
+        return False
+    return datetime.now() < datetime.fromisoformat(subscription_until)
 
 def check_limit(user_id):
     if user_id == ADMIN_ID:
         return True, None
 
-    role, message_count, reset_time = get_user(user_id)
+    role, message_count, subscription_until, reset_time, custom_limit, blocked = get_user(user_id)
+
+    if blocked == 1:
+        return False, "blocked"
+
+    if is_subscription_active(subscription_until):
+        return True, None
+
+    limit = custom_limit if custom_limit else FREE_LIMIT
 
     now = datetime.now()
     reset_dt = datetime.fromisoformat(reset_time)
@@ -122,9 +127,15 @@ def check_limit(user_id):
         conn.commit()
         return True, None
 
-    if message_count >= FREE_LIMIT:
+    if message_count >= limit:
         remaining = reset_dt - now
         return False, remaining
+
+    cursor.execute(
+        "UPDATE users SET message_count = message_count + 1 WHERE user_id = ?",
+        (user_id,)
+    )
+    conn.commit()
 
     return True, None
 
@@ -138,23 +149,6 @@ def generate_image_url(prompt):
 async def webhook(request: Request):
     data = await request.json()
 
-    # CALLBACK
-    if "callback_query" in data:
-        callback = data["callback_query"]
-        user_id = callback["from"]["id"]
-        chat_id = callback["message"]["chat"]["id"]
-        action = callback["data"]
-
-        answer_callback(callback["id"])
-
-        if action.startswith("role_"):
-            role = action.replace("role_", "")
-            cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
-            conn.commit()
-            send_message(chat_id, f"✅ Роль изменена на: {role}", main_menu(is_admin=(user_id == ADMIN_ID)))
-
-        return {"ok": True}
-
     if "message" not in data:
         return {"ok": True}
 
@@ -163,63 +157,105 @@ async def webhook(request: Request):
     user_id = message["from"]["id"]
     text = message.get("text")
 
+    role, message_count, subscription_until, reset_time, custom_limit, blocked = get_user(user_id)
+    update_activity(user_id)
+
     if text == "/start":
         send_message(chat_id, "🤖 Добро пожаловать!", main_menu(is_admin=(user_id == ADMIN_ID)))
         return {"ok": True}
 
-    if text == "🎭 Роли":
-        send_message(chat_id, "Выберите роль:", roles_keyboard())
+    # ===== АДМИН КОМАНДЫ =====
+
+    if text == "⚙ Админ-панель" and user_id == ADMIN_ID:
+        send_message(chat_id,
+                     "Админ-команды:\n"
+                     "/pro ID\n"
+                     "/unpro ID\n"
+                     "/setlimit ID 50\n"
+                     "/block ID\n"
+                     "/unblock ID\n"
+                     "/top\n"
+                     "/activity",
+                     main_menu(True))
         return {"ok": True}
 
-    if text == "🎨 Картинка":
-        send_message(
-            chat_id,
-            "Чтобы сгенерировать картинку, используйте команду:\n\n"
-            "/image описание\n\n"
-            "Пример:\n"
-            "/image закат над морем",
-            main_menu(is_admin=(user_id == ADMIN_ID))
-        )
-        return {"ok": True}
+    if text and user_id == ADMIN_ID:
 
-    if text.startswith("/image"):
-        allowed, remaining = check_limit(user_id)
-        if not allowed:
-            hours = remaining.seconds // 3600
-            minutes = (remaining.seconds % 3600) // 60
+        if text.startswith("/pro"):
+            target = int(text.split()[1])
+            until = (datetime.now() + timedelta(days=30)).isoformat()
+            cursor.execute("UPDATE users SET subscription_until = ? WHERE user_id = ?", (until, target))
+            conn.commit()
+            send_message(chat_id, f"✅ PRO выдан до {until[:10]}")
+            return {"ok": True}
+
+        if text.startswith("/unpro"):
+            target = int(text.split()[1])
+            cursor.execute("UPDATE users SET subscription_until = NULL WHERE user_id = ?", (target,))
+            conn.commit()
+            send_message(chat_id, "✅ PRO снят")
+            return {"ok": True}
+
+        if text.startswith("/setlimit"):
+            parts = text.split()
+            target = int(parts[1])
+            new_limit = int(parts[2])
+            cursor.execute("UPDATE users SET custom_limit = ? WHERE user_id = ?", (new_limit, target))
+            conn.commit()
+            send_message(chat_id, f"✅ Лимит изменён на {new_limit}")
+            return {"ok": True}
+
+        if text.startswith("/block"):
+            target = int(text.split()[1])
+            cursor.execute("UPDATE users SET blocked = 1 WHERE user_id = ?", (target,))
+            conn.commit()
+            send_message(chat_id, "🚫 Пользователь заблокирован")
+            return {"ok": True}
+
+        if text.startswith("/unblock"):
+            target = int(text.split()[1])
+            cursor.execute("UPDATE users SET blocked = 0 WHERE user_id = ?", (target,))
+            conn.commit()
+            send_message(chat_id, "✅ Пользователь разблокирован")
+            return {"ok": True}
+
+        if text == "/top":
+            cursor.execute("SELECT user_id, message_count FROM users ORDER BY message_count DESC LIMIT 10")
+            users = cursor.fetchall()
+            text = "🏆 ТОП пользователей:\n"
+            for u in users:
+                text += f"{u[0]} — {u[1]}\n"
+            send_message(chat_id, text)
+            return {"ok": True}
+
+        if text == "/activity":
+            cursor.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", 
+                           ((datetime.now() - timedelta(days=1)).isoformat(),))
+            count = cursor.fetchone()[0]
+            send_message(chat_id, f"📊 Активных за 24ч: {count}")
+            return {"ok": True}
+
+    # ===== ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ =====
+
+    allowed, info = check_limit(user_id)
+
+    if allowed is False:
+        if info == "blocked":
+            send_message(chat_id, "🚫 Вы заблокированы.")
+            return {"ok": True}
+        else:
+            hours = info.seconds // 3600
+            minutes = (info.seconds % 3600) // 60
             send_message(chat_id,
                          f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
                          main_menu(is_admin=(user_id == ADMIN_ID)))
             return {"ok": True}
 
+    if text.startswith("/image"):
         prompt = text.replace("/image", "").strip()
         image_url = generate_image_url(prompt)
         send_photo_by_url(chat_id, image_url)
-        increment_message_count(user_id)
         return {"ok": True}
-
-    if text == "📊 Статистика":
-        role, message_count, reset_time = get_user(user_id)
-        reset_dt = datetime.fromisoformat(reset_time)
-        send_message(
-            chat_id,
-            f"📊 Сообщений сегодня: {message_count}/{FREE_LIMIT}\n"
-            f"⏳ Сброс: {reset_dt.strftime('%d.%m %H:%M')}",
-            main_menu(is_admin=(user_id == ADMIN_ID))
-        )
-        return {"ok": True}
-
-    # AI
-    allowed, remaining = check_limit(user_id)
-    if not allowed:
-        hours = remaining.seconds // 3600
-        minutes = (remaining.seconds % 3600) // 60
-        send_message(chat_id,
-                     f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
-                     main_menu(is_admin=(user_id == ADMIN_ID)))
-        return {"ok": True}
-
-    role, _, _ = get_user(user_id)
 
     response = groq.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -231,7 +267,6 @@ async def webhook(request: Request):
     )
 
     reply = response.choices[0].message.content
-    increment_message_count(user_id)
     send_message(chat_id, reply, main_menu(is_admin=(user_id == ADMIN_ID)))
 
     return {"ok": True}
