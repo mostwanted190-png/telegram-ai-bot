@@ -25,6 +25,7 @@ cursor = conn.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
+    role TEXT DEFAULT 'ассистент',
     message_count INTEGER DEFAULT 0,
     subscription INTEGER DEFAULT 0,
     reset_time TEXT
@@ -33,17 +34,26 @@ CREATE TABLE IF NOT EXISTS users (
 
 conn.commit()
 
+# ===== РОЛИ =====
+
+ROLES = {
+    "ассистент": "Ты дружелюбный AI ассистент.",
+    "программист": "Ты опытный программист. Помогай с кодом.",
+    "учитель": "Ты терпеливый учитель. Объясняй просто."
+}
+
 # ===== МЕНЮ =====
 
 def main_menu():
     return {
         "inline_keyboard": [
             [
-                {"text": "🎨 Генерация картинок", "callback_data": "image_info"}
+                {"text": "🎭 Роли", "callback_data": "roles"},
+                {"text": "🎨 Картинка", "callback_data": "image_info"}
             ],
             [
                 {"text": "📊 Статистика", "callback_data": "stats"},
-                {"text": "💎 Купить подписку", "callback_data": "buy"}
+                {"text": "💎 Подписка", "callback_data": "buy"}
             ]
         ]
     }
@@ -63,7 +73,7 @@ def send_photo_by_url(chat_id, image_url):
     )
 
 def get_user(user_id):
-    cursor.execute("SELECT message_count, subscription, reset_time FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT role, message_count, subscription, reset_time FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
     if not result:
         reset = (datetime.now() + timedelta(hours=24)).isoformat()
@@ -72,14 +82,14 @@ def get_user(user_id):
             (user_id, reset)
         )
         conn.commit()
-        return 0, 0, reset
+        return "ассистент", 0, 0, reset
     return result
 
 def check_limit(user_id):
     if user_id == ADMIN_ID:
         return True, None
 
-    message_count, subscription, reset_time = get_user(user_id)
+    role, message_count, subscription, reset_time = get_user(user_id)
 
     if subscription == 1:
         return True, None
@@ -105,7 +115,6 @@ def check_limit(user_id):
         (user_id,)
     )
     conn.commit()
-
     return True, None
 
 def generate_image_url(prompt):
@@ -130,33 +139,39 @@ async def webhook(request: Request):
             json={"callback_query_id": callback["id"]}
         )
 
-        if action == "buy":
-            send_message(
-                chat_id,
-                "💎 Подписка PRO убирает лимит.\n\n"
-                "Напишите администратору для подключения.",
-                main_menu()
-            )
+        if action == "roles":
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "🧑‍💼 Ассистент", "callback_data": "role_ассистент"}],
+                    [{"text": "👨‍💻 Программист", "callback_data": "role_программист"}],
+                    [{"text": "📚 Учитель", "callback_data": "role_учитель"}]
+                ]
+            }
+            send_message(chat_id, "Выберите роль:", keyboard)
+
+        elif action.startswith("role_"):
+            role = action.replace("role_", "")
+            cursor.execute("UPDATE users SET role = ? WHERE user_id = ?", (role, user_id))
+            conn.commit()
+            send_message(chat_id, f"✅ Роль изменена на: {role}", main_menu())
+
+        elif action == "image_info":
+            send_message(chat_id, "Напишите: /image описание", main_menu())
 
         elif action == "stats":
-            message_count, subscription, reset_time = get_user(user_id)
+            role, message_count, subscription, reset_time = get_user(user_id)
             if subscription == 1:
-                text = "💎 У вас активна подписка PRO."
+                text = "💎 У вас подписка PRO."
             else:
                 reset_dt = datetime.fromisoformat(reset_time)
                 text = (
                     f"📊 Использовано: {message_count}/{FREE_LIMIT}\n"
-                    f"⏳ Сброс лимита: {reset_dt.strftime('%d.%m %H:%M')}"
+                    f"⏳ Сброс: {reset_dt.strftime('%d.%m %H:%M')}"
                 )
             send_message(chat_id, text, main_menu())
 
-        elif action == "image_info":
-            send_message(
-                chat_id,
-                "Используйте команду:\n/image описание\n\n"
-                "Пример:\n/image закат над морем",
-                main_menu()
-            )
+        elif action == "buy":
+            send_message(chat_id, "💎 Напишите администратору для подключения PRO.", main_menu())
 
         return {"ok": True}
 
@@ -169,86 +184,52 @@ async def webhook(request: Request):
     text = message.get("text")
 
     if text == "/start":
-        send_message(
-            chat_id,
-            "🤖 Добро пожаловать!\n\n"
-            f"Бесплатно: {FREE_LIMIT} сообщений на 24 часа.",
-            main_menu()
-        )
+        send_message(chat_id, "🤖 Добро пожаловать!", main_menu())
         return {"ok": True}
-
-    # ===== АДМИН ВЫДАЧА ПОДПИСКИ =====
 
     if text and text.startswith("/give_sub") and user_id == ADMIN_ID:
-        try:
-            target_id = int(text.split()[1])
-            cursor.execute(
-                "UPDATE users SET subscription = 1 WHERE user_id = ?",
-                (target_id,)
-            )
-            conn.commit()
-            send_message(chat_id, "✅ Подписка выдана.")
-        except:
-            send_message(chat_id, "Ошибка команды.")
+        target = int(text.split()[1])
+        cursor.execute("UPDATE users SET subscription = 1 WHERE user_id = ?", (target,))
+        conn.commit()
+        send_message(chat_id, "✅ Подписка выдана.")
         return {"ok": True}
-
-    # ===== IMAGE =====
 
     if text and text.startswith("/image"):
         allowed, remaining = check_limit(user_id)
-
         if not allowed:
             hours = remaining.seconds // 3600
             minutes = (remaining.seconds % 3600) // 60
-            send_message(
-                chat_id,
-                f"🚫 Лимит исчерпан.\n"
-                f"⏳ Сброс через: {hours}ч {minutes}м\n\n"
-                "💎 Нажмите «Купить подписку» для безлимита.",
-                main_menu()
-            )
+            send_message(chat_id,
+                         f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
+                         main_menu())
             return {"ok": True}
 
         prompt = text.replace("/image", "").strip()
-        if not prompt:
-            send_message(chat_id, "Напишите: /image описание", main_menu())
-            return {"ok": True}
-
-        send_message(chat_id, "🎨 Генерирую...")
         image_url = generate_image_url(prompt)
         send_photo_by_url(chat_id, image_url)
         return {"ok": True}
 
-    # ===== AI ТЕКСТ =====
-
     allowed, remaining = check_limit(user_id)
-
     if not allowed:
         hours = remaining.seconds // 3600
         minutes = (remaining.seconds % 3600) // 60
-        send_message(
-            chat_id,
-            f"🚫 Лимит исчерпан.\n"
-            f"⏳ Сброс через: {hours}ч {minutes}м\n\n"
-            "💎 Нажмите «Купить подписку» для безлимита.",
-            main_menu()
-        )
+        send_message(chat_id,
+                     f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
+                     main_menu())
         return {"ok": True}
 
-    try:
-        response = groq.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "Ты полезный AI ассистент."},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=600,
-        )
+    role, _, _, _ = get_user(user_id)
 
-        reply = response.choices[0].message.content
-        send_message(chat_id, reply, main_menu())
+    response = groq.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": ROLES[role]},
+            {"role": "user", "content": text}
+        ],
+        max_tokens=600,
+    )
 
-    except:
-        send_message(chat_id, "⚠ Ошибка AI", main_menu())
+    reply = response.choices[0].message.content
+    send_message(chat_id, reply, main_menu())
 
     return {"ok": True}
