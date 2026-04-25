@@ -44,19 +44,22 @@ ROLES = {
 
 # ===== МЕНЮ =====
 
-def main_menu():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🎭 Роли", "callback_data": "roles"},
-                {"text": "🎨 Картинка", "callback_data": "image_info"}
-            ],
-            [
-                {"text": "📊 Статистика", "callback_data": "stats"},
-                {"text": "💎 Подписка", "callback_data": "buy"}
-            ]
+def main_menu(is_admin=False):
+    buttons = [
+        [
+            {"text": "🎭 Роли", "callback_data": "roles"},
+            {"text": "🎨 Картинка", "callback_data": "image_info"}
+        ],
+        [
+            {"text": "📊 Статистика", "callback_data": "stats"},
+            {"text": "💎 Подписка", "callback_data": "buy"}
         ]
-    }
+    ]
+
+    if is_admin:
+        buttons.append([{"text": "⚙ Админ‑панель", "callback_data": "admin_panel"}])
+
+    return {"inline_keyboard": buttons}
 
 # ===== УТИЛИТЫ =====
 
@@ -96,17 +99,8 @@ def check_limit(user_id):
 
     role, message_count, subscription_until, reset_time = get_user(user_id)
 
-    # ✅ Проверка подписки
     if is_subscription_active(subscription_until):
         return True, None
-
-    # ✅ Если подписка истекла — сброс
-    if subscription_until and not is_subscription_active(subscription_until):
-        cursor.execute(
-            "UPDATE users SET subscription_until = NULL WHERE user_id = ?",
-            (user_id,)
-        )
-        conn.commit()
 
     now = datetime.now()
     reset_dt = datetime.fromisoformat(reset_time)
@@ -154,24 +148,7 @@ async def webhook(request: Request):
             json={"callback_query_id": callback["id"]}
         )
 
-        if action == "stats":
-            role, count, sub_until, reset_time = get_user(user_id)
-
-            if is_subscription_active(sub_until):
-                text = f"💎 Подписка активна до: {sub_until[:10]}"
-            else:
-                reset_dt = datetime.fromisoformat(reset_time)
-                text = f"📊 Использовано: {count}/{FREE_LIMIT}\n⏳ Сброс: {reset_dt.strftime('%d.%m %H:%M')}"
-
-            send_message(chat_id, text, main_menu())
-
-        elif action == "buy":
-            send_message(chat_id,
-                         "💎 Подписка PRO — 30 дней.\n\n"
-                         "Напишите администратору.",
-                         main_menu())
-
-        elif action == "admin_panel" and user_id == ADMIN_ID:
+        if action == "admin_panel" and user_id == ADMIN_ID:
             cursor.execute("SELECT user_id FROM users")
             users = cursor.fetchall()
 
@@ -205,19 +182,24 @@ async def webhook(request: Request):
     user_id = message["from"]["id"]
     text = message.get("text")
 
+    # ✅ Проверка ID
+    if text == "/id":
+        send_message(chat_id, f"Ваш ID: {user_id}")
+        return {"ok": True}
+
     if text == "/start":
-        send_message(chat_id, "🤖 Добро пожаловать!", main_menu())
+        send_message(
+            chat_id,
+            "🤖 Добро пожаловать!",
+            main_menu(is_admin=(user_id == ADMIN_ID))
+        )
         return {"ok": True}
 
     if text == "/admin" and user_id == ADMIN_ID:
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "⚙ Админ‑панель", "callback_data": "admin_panel"}]
-            ]
-        }
-        send_message(chat_id, "Панель администратора:", keyboard)
+        send_message(chat_id, "Админ‑панель:", main_menu(is_admin=True))
         return {"ok": True}
 
+    # ===== IMAGE =====
     if text and text.startswith("/image"):
         allowed, remaining = check_limit(user_id)
 
@@ -226,13 +208,15 @@ async def webhook(request: Request):
             minutes = (remaining.seconds % 3600) // 60
             send_message(chat_id,
                          f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
-                         main_menu())
+                         main_menu(is_admin=(user_id == ADMIN_ID)))
             return {"ok": True}
 
         prompt = text.replace("/image", "").strip()
         image_url = generate_image_url(prompt)
         send_photo_by_url(chat_id, image_url)
         return {"ok": True}
+
+    # ===== AI =====
 
     allowed, remaining = check_limit(user_id)
 
@@ -241,7 +225,7 @@ async def webhook(request: Request):
         minutes = (remaining.seconds % 3600) // 60
         send_message(chat_id,
                      f"🚫 Лимит исчерпан.\n⏳ Через {hours}ч {minutes}м",
-                     main_menu())
+                     main_menu(is_admin=(user_id == ADMIN_ID)))
         return {"ok": True}
 
     role, _, _, _ = get_user(user_id)
@@ -256,6 +240,6 @@ async def webhook(request: Request):
     )
 
     reply = response.choices[0].message.content
-    send_message(chat_id, reply, main_menu())
+    send_message(chat_id, reply, main_menu(is_admin=(user_id == ADMIN_ID)))
 
     return {"ok": True}
